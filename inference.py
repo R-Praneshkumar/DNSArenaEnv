@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Baseline inference script for the DNS-Env OpenEnv hackathon.
+"""Baseline inference script for DNS-Env (OpenEnv Hackathon).
 
-Runs an LLM-driven agent through all three DNS debugging tasks,
-communicating with the environment server over HTTP.
-
-Requirements
-------------
-- Environment server running at ENV_URL (default http://localhost:7860).
-- OpenAI-compatible LLM endpoint at API_BASE_URL.
-- HF_TOKEN or OPENAI_API_KEY set for authentication.
-
-Stdout logging format
----------------------
-[START] task_id=<id>
-[STEP]  task_id=<id> step=<n> command=<cmd> reward=<r> done=<bool>
-[END]   task_id=<id> score=<float> steps=<n>
+STDOUT FORMAT (mandatory — any deviation = incorrect scoring):
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 from __future__ import annotations
@@ -25,7 +15,7 @@ import re
 import sys
 import time
 import traceback
-from typing import Any
+from typing import Any, List, Optional
 
 import requests
 from openai import OpenAI
@@ -43,11 +33,13 @@ ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 TASKS = ["fix_single_record", "configure_mail", "debug_delegation"]
+BENCHMARK = "dns_env"
 
 # Safety limits
 MAX_STEPS_PER_TASK = 25
 MAX_RETRIES_HTTP = 3
-HTTP_TIMEOUT = 60  # seconds
+HTTP_TIMEOUT = 60
+SUCCESS_SCORE_THRESHOLD = 0.5
 
 # ---------------------------------------------------------------------------
 # OpenAI client
@@ -57,6 +49,32 @@ client = OpenAI(
     base_url=API_BASE_URL,
     api_key=HF_TOKEN or os.getenv("OPENAI_API_KEY", ""),
 )
+
+# ---------------------------------------------------------------------------
+# Mandatory stdout log functions
+# ---------------------------------------------------------------------------
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -136,7 +154,7 @@ Do not include explanations outside the JSON. Example:
 """
 
 # ---------------------------------------------------------------------------
-# HTTP helpers (self-contained, no dependency on client.py)
+# HTTP helpers
 # ---------------------------------------------------------------------------
 
 
@@ -150,31 +168,18 @@ def _post(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
             return resp.json()
         except (requests.RequestException, ValueError) as exc:
             if attempt == MAX_RETRIES_HTTP:
-                print(
-                    f"[ERROR] HTTP POST {endpoint} failed after "
-                    f"{MAX_RETRIES_HTTP} attempts: {exc}",
-                    file=sys.stderr,
-                )
                 raise
             time.sleep(1.0 * attempt)
-    return {}  # unreachable, satisfies type checker
+    return {}
 
 
 def reset_env(task_id: str) -> dict[str, Any]:
-    """Reset the environment for a specific task."""
-    body: dict[str, Any] = {
-        "session_id": "default",
-        "options": {"task_id": task_id},
-    }
+    body: dict[str, Any] = {"session_id": "default", "options": {"task_id": task_id}}
     return _post("/reset", body)
 
 
 def step_env(action: dict[str, Any]) -> dict[str, Any]:
-    """Execute one action in the environment."""
-    body = {
-        "session_id": "default",
-        "action": action,
-    }
+    body = {"session_id": "default", "action": action}
     return _post("/step", body)
 
 
@@ -184,63 +189,36 @@ def step_env(action: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_prompt(
-    obs: dict[str, Any],
-    task_id: str,
-    step_num: int,
-    max_steps: int,
+    obs: dict[str, Any], task_id: str, step_num: int, max_steps: int,
     history: list[dict[str, str]],
 ) -> str:
-    """Build the user-turn prompt from the current observation.
-
-    Includes the task description, current observation output, zone names,
-    step budget, and recent action history for context.
-    """
     parts: list[str] = []
-
-    # Task description
     task_desc = obs.get("task_description", "")
     if task_desc:
         parts.append(f"## Task: {task_id}\n{task_desc}")
-
-    # Available zones
     zone_names = obs.get("zone_names", [])
     if zone_names:
         parts.append(f"Available zones: {', '.join(zone_names)}")
-
-    # Step budget
     remaining = max_steps - step_num
     parts.append(f"Step {step_num}/{max_steps} (remaining: {remaining})")
-
-    # Recent action history (last 3 actions for context)
     if history:
         recent = history[-3:]
-        history_lines = []
+        lines = []
         for h in recent:
-            history_lines.append(f"  Action: {h['action']}")
-            # Truncate long outputs
-            result_preview = h["result"][:300]
+            lines.append(f"  Action: {h['action']}")
+            preview = h["result"][:300]
             if len(h["result"]) > 300:
-                result_preview += "..."
-            history_lines.append(f"  Result: {result_preview}")
-        parts.append("## Recent History\n" + "\n".join(history_lines))
-
-    # Current observation output
+                preview += "..."
+            lines.append(f"  Result: {preview}")
+        parts.append("## Recent History\n" + "\n".join(lines))
     output = obs.get("output", "")
     if output:
         parts.append(f"## Current Output\n{output}")
-
-    # Instruction
     if remaining <= 3:
         parts.append(
-            "WARNING: You are running low on steps. If your fixes are "
-            "done, submit now with: {\"command\": \"submit\", \"args\": {}}"
+            'WARNING: Running low on steps. Submit now: {"command": "submit", "args": {}}'
         )
-
-    parts.append(
-        "Respond with a single JSON object: "
-        "{\"command\": \"...\", \"args\": {...}}"
-    )
-
+    parts.append('Respond with a single JSON object: {"command": "...", "args": {...}}')
     return "\n\n".join(parts)
 
 
@@ -248,66 +226,35 @@ def build_prompt(
 # LLM response parsing
 # ---------------------------------------------------------------------------
 
-# Patterns for extracting JSON from LLM responses
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
 _JSON_OBJECT_RE = re.compile(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL)
 
 
 def parse_llm_response(text: str | None) -> dict[str, Any]:
-    """Extract a JSON action from the LLM's response text.
-
-    Handles several formats:
-    1. Pure JSON response.
-    2. JSON inside markdown code blocks (```json ... ```).
-    3. JSON embedded in surrounding text.
-    4. Fallback: returns a safe default action (view_zone).
-
-    Returns
-    -------
-    dict
-        Action dict with "command" (str) and "args" (dict).
-    """
     default_action: dict[str, Any] = {"command": "view_zone", "args": {}}
-
     if not text:
         return default_action
-
     text = text.strip()
-
-    # Strategy 1: try parsing the entire response as JSON
     action = _try_parse_json(text)
     if action is not None:
         return action
-
-    # Strategy 2: look for JSON inside markdown code blocks
     match = _JSON_BLOCK_RE.search(text)
     if match:
         action = _try_parse_json(match.group(1).strip())
         if action is not None:
             return action
-
-    # Strategy 3: find the first JSON object in the text
     match = _JSON_OBJECT_RE.search(text)
     if match:
         action = _try_parse_json(match.group(0))
         if action is not None:
             return action
-
-    # Strategy 4: fallback
-    print(
-        f"[WARN] Could not parse LLM response as JSON, using fallback. "
-        f"Response was: {text[:200]}",
-        file=sys.stderr,
-    )
     return default_action
 
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
-    """Attempt to parse *text* as a JSON action. Returns None on failure."""
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "command" in data:
-            # Ensure args is always a dict
             if "args" not in data or not isinstance(data.get("args"), dict):
                 data["args"] = data.get("args", {}) or {}
             return {"command": str(data["command"]), "args": data["args"]}
@@ -321,32 +268,19 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def call_llm(
-    messages: list[dict[str, str]],
-    temperature: float = 0.0,
-) -> str:
-    """Call the LLM and return the assistant's response text.
-
-    Retries once on transient errors.
-    """
+def call_llm(messages: list[dict[str, str]], temperature: float = 0.0) -> str:
     for attempt in range(1, 3):
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=temperature,
+                model=MODEL_NAME, messages=messages, temperature=temperature,
             )
             content = response.choices[0].message.content
             return content if content else ""
         except Exception as exc:
             if attempt == 2:
-                print(
-                    f"[ERROR] LLM call failed: {exc}",
-                    file=sys.stderr,
-                )
                 raise
             time.sleep(2.0)
-    return ""  # unreachable
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -355,168 +289,120 @@ def call_llm(
 
 
 def run_task(task_id: str) -> float:
-    """Run a single task and return the score.
+    """Run a single task. Returns score in [0, 1]."""
 
-    Returns
-    -------
-    float
-        The final score for the task (0.0-1.0).
-    """
-    print(f"[START] task_id={task_id}")
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
 
-    # Reset environment
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+
     try:
         obs = reset_env(task_id)
     except Exception as exc:
-        print(f"[ERROR] Failed to reset environment for {task_id}: {exc}", file=sys.stderr)
-        print(f"[END] task_id={task_id} score=0.0 steps=0")
+        print(f"[ERROR] Failed to reset: {exc}", file=sys.stderr)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         return 0.0
 
-    step_num = 0
     max_steps = MAX_STEPS_PER_TASK
     history: list[dict[str, str]] = []
+    messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Build conversation with system prompt
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-    ]
+    try:
+        while not obs.get("done", False):
+            steps_taken += 1
 
-    while not obs.get("done", False):
-        step_num += 1
+            prompt = build_prompt(obs, task_id, steps_taken, max_steps, history)
+            messages.append({"role": "user", "content": prompt})
 
-        # Build the user prompt for this step
-        prompt = build_prompt(obs, task_id, step_num, max_steps, history)
-        messages.append({"role": "user", "content": prompt})
-
-        # Call the LLM
-        try:
-            llm_text = call_llm(messages)
-        except Exception as exc:
-            print(
-                f"[ERROR] LLM call failed at step {step_num}: {exc}",
-                file=sys.stderr,
-            )
-            # Try to submit gracefully
-            action = {"command": "submit", "args": {}}
-            llm_text = json.dumps(action)
-
-        # Add assistant response to conversation
-        messages.append({"role": "assistant", "content": llm_text})
-
-        # Parse the action
-        action = parse_llm_response(llm_text)
-
-        # Record in history
-        history.append({"action": json.dumps(action), "result": ""})
-
-        # Execute the action
-        try:
-            obs = step_env(action)
-        except Exception as exc:
-            print(
-                f"[ERROR] step_env failed at step {step_num}: {exc}",
-                file=sys.stderr,
-            )
-            # Force submit on error
             try:
-                obs = step_env({"command": "submit", "args": {}})
+                llm_text = call_llm(messages)
             except Exception:
-                obs = {"done": True, "reward": 0.0}
-            break
+                action = {"command": "submit", "args": {}}
+                llm_text = json.dumps(action)
 
-        # Update history with result
-        if history:
-            output_preview = obs.get("output", "")[:500]
-            history[-1]["result"] = output_preview
+            messages.append({"role": "assistant", "content": llm_text})
+            action = parse_llm_response(llm_text)
+            history.append({"action": json.dumps(action), "result": ""})
 
-        # Log the step
-        reward = obs.get("reward")
-        reward_str = f"{reward}" if reward is not None else "null"
-        done = obs.get("done", False)
-        print(
-            f"[STEP] task_id={task_id} step={step_num} "
-            f"command={action['command']} reward={reward_str} done={done}"
-        )
-
-        # Safety limit: force submit
-        if step_num >= max_steps and not obs.get("done", False):
-            print(
-                f"[WARN] Reached step limit ({max_steps}) for {task_id}, "
-                f"forcing submit.",
-                file=sys.stderr,
-            )
             try:
-                obs = step_env({"command": "submit", "args": {}})
-                reward = obs.get("reward")
-                reward_str = f"{reward}" if reward is not None else "null"
-                print(
-                    f"[STEP] task_id={task_id} step={step_num + 1} "
-                    f"command=submit reward={reward_str} done={obs.get('done', False)}"
-                )
+                obs = step_env(action)
             except Exception:
-                obs = {"done": True, "reward": 0.0}
-            break
+                try:
+                    obs = step_env({"command": "submit", "args": {}})
+                except Exception:
+                    obs = {"done": True, "reward": 0.0}
+                break
 
-        # Keep conversation history manageable: trim old messages if too long
-        # Keep system prompt + last 20 exchanges (40 messages)
-        if len(messages) > 41:
-            messages = [messages[0]] + messages[-40:]
+            if history:
+                history[-1]["result"] = obs.get("output", "")[:500]
 
-    # Final score
-    score = obs.get("reward", 0.0)
-    if score is None:
-        score = 0.0
-    print(f"[END] task_id={task_id} score={score} steps={step_num}")
-    return float(score)
+            reward = obs.get("reward")
+            reward_val = float(reward) if reward is not None else 0.0
+            done = obs.get("done", False)
+            error = None
+
+            rewards.append(reward_val)
+
+            action_str = json.dumps(action)
+            log_step(step=steps_taken, action=action_str, reward=reward_val, done=done, error=error)
+
+            if steps_taken >= max_steps and not obs.get("done", False):
+                try:
+                    obs = step_env({"command": "submit", "args": {}})
+                    reward = obs.get("reward")
+                    reward_val = float(reward) if reward is not None else 0.0
+                    rewards.append(reward_val)
+                    steps_taken += 1
+                    log_step(
+                        step=steps_taken,
+                        action='{"command":"submit","args":{}}',
+                        reward=reward_val,
+                        done=obs.get("done", False),
+                        error=None,
+                    )
+                except Exception:
+                    obs = {"done": True, "reward": 0.0}
+                break
+
+            if len(messages) > 41:
+                messages = [messages[0]] + messages[-40:]
+
+        score = obs.get("reward", 0.0)
+        if score is None:
+            score = 0.0
+        score = float(score)
+        score = min(max(score, 0.0), 1.0)
+        success = score >= SUCCESS_SCORE_THRESHOLD
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return score
 
 
 def main() -> None:
-    """Run inference on all tasks and report aggregate results."""
-    print("=" * 60)
-    print("DNS-Env Baseline Inference")
-    print(f"  API_BASE_URL: {API_BASE_URL}")
-    print(f"  MODEL_NAME:   {MODEL_NAME}")
-    print(f"  ENV_URL:      {ENV_URL}")
-    print("=" * 60)
-
-    # Verify the environment server is reachable
     try:
         resp = requests.get(f"{ENV_URL}/health", timeout=10)
         resp.raise_for_status()
-        print(f"Environment server health: {resp.json()}")
     except Exception as exc:
-        print(
-            f"[FATAL] Cannot reach environment server at {ENV_URL}: {exc}",
-            file=sys.stderr,
-        )
+        print(f"[FATAL] Cannot reach environment at {ENV_URL}: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Run all tasks
     scores: dict[str, float] = {}
     for task_id in TASKS:
         try:
             score = run_task(task_id)
             scores[task_id] = score
         except Exception as exc:
-            print(
-                f"[ERROR] Task {task_id} failed with exception: {exc}",
-                file=sys.stderr,
-            )
             traceback.print_exc(file=sys.stderr)
             scores[task_id] = 0.0
-            print(f"[END] task_id={task_id} score=0.0 steps=0")
+            log_end(success=False, steps=0, score=0.0, rewards=[])
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("RESULTS SUMMARY")
-    print("=" * 60)
-    total = 0.0
-    for task_id, score in scores.items():
-        print(f"  {task_id:25s}  {score:.4f}")
-        total += score
+    total = sum(scores.values())
     avg = total / len(scores) if scores else 0.0
-    print(f"  {'AVERAGE':25s}  {avg:.4f}")
-    print("=" * 60)
+    print(f"\nAverage score: {avg:.2f}", file=sys.stderr)
 
 
 if __name__ == "__main__":
