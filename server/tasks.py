@@ -3,7 +3,7 @@
 Defines three progressively harder DNS debugging scenarios:
   1. fix_single_record  (EASY)   - Fix broken records in a single zone file.
   2. configure_mail     (MEDIUM) - Add missing email infrastructure records.
-  3. debug_delegation   (HARD)   - Repair broken subdomain delegation across two zones.
+  3. debug_delegation   (HARD)   - Repair broken three-zone delegation chain.
 
 Each task ships a deliberately broken or incomplete set of zone-file records
 that an AI agent must diagnose and correct within a step budget.
@@ -114,7 +114,16 @@ def _build_fix_single_record() -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_configure_mail() -> dict:
-    """Single-zone task: add complete email infrastructure to acme.co."""
+    """Single-zone task: fix broken email configuration in acme.co.
+
+    The zone already has email records, but they contain five subtle bugs:
+      1. "mail" is a CNAME (conflicts with MX) — must be replaced with A record
+      2. Both MX records have the same priority (10) — backup should be 20
+      3. mail2 has no A record — MX points to it but it can't resolve
+      4. SPF has wrong subnet (10.0.2.0/24) and softfail (~all) instead of
+         the correct 10.0.1.0/24 with hardfail (-all)
+      5. DMARC policy is "none" — should be "quarantine"
+    """
 
     records = [
         DNSRecord("@", "SOA",
@@ -125,20 +134,34 @@ def _build_configure_mail() -> dict:
         DNSRecord("www", "CNAME", "acme.co."),
         DNSRecord("ns1", "A", "10.0.1.2"),
         DNSRecord("ns2", "A", "10.0.1.3"),
+        # BUG 1: CNAME at "mail" — conflicts with MX pointing to mail.acme.co
+        # Agent must DELETE this CNAME and ADD an A record instead
+        DNSRecord("mail", "CNAME", "acme.co."),
+        # BUG 2: Both MX records have same priority (10) — backup should be 20
+        DNSRecord("@", "MX", "10 mail.acme.co."),
+        DNSRecord("@", "MX", "10 mail2.acme.co."),
+        # BUG 3: mail2 has no A record — MX points to it but it can't resolve
+        # (agent must ADD: mail2 A 10.0.1.11)
+        # BUG 4: SPF has wrong subnet and softfail instead of hardfail
+        DNSRecord("@", "TXT", "\"v=spf1 ip4:10.0.2.0/24 ~all\""),
+        # BUG 5: DMARC policy is "none" — should be "quarantine"
+        DNSRecord("_dmarc", "TXT",
+                  "\"v=DMARC1; p=none; rua=mailto:postmaster@acme.co\""),
     ]
 
     required_checks = [
+        # mail must be an A record (not CNAME) pointing to correct IP
         {"qname": "mail",   "qtype": "A",   "expected_rdata": "10.0.1.10"},
+        # mail2 must exist as A record
         {"qname": "mail2",  "qtype": "A",   "expected_rdata": "10.0.1.11"},
-        {"qname": "@",      "qtype": "MX",  "expected_rdata_contains": "10 mail.acme.co."},
-        {"qname": "@",      "qtype": "MX",  "expected_rdata_contains": "20 mail2.acme.co."},
-        {"qname": "@",      "qtype": "TXT", "expected_rdata_contains": "v=spf1"},
+        # MX priorities must be correct (10 and 20, not both 10)
+        {"qname": "@",      "qtype": "MX",  "expected_rdata": "10 mail.acme.co."},
+        {"qname": "@",      "qtype": "MX",  "expected_rdata": "20 mail2.acme.co."},
+        # SPF must have correct subnet and hardfail
         {"qname": "@",      "qtype": "TXT", "expected_rdata_contains": "ip4:10.0.1.0/24"},
         {"qname": "@",      "qtype": "TXT", "expected_rdata_contains": "-all"},
-        {"qname": "_dmarc", "qtype": "TXT", "expected_rdata_contains": "v=DMARC1"},
+        # DMARC must have quarantine policy
         {"qname": "_dmarc", "qtype": "TXT", "expected_rdata_contains": "p=quarantine"},
-        {"qname": "_dmarc", "qtype": "TXT",
-         "expected_rdata_contains": "rua=mailto:postmaster@acme.co"},
     ]
 
     original_correct = {
@@ -155,19 +178,23 @@ def _build_configure_mail() -> dict:
     return {
         "task_id": "configure_mail",
         "description": (
-            "The acme.co domain needs complete email delivery configuration. "
-            "Currently the zone has basic web records but NO email setup. "
-            "Your task: Configure mail delivery according to this "
-            "specification:\n\n"
+            "The acme.co domain has email delivery problems. Users report "
+            "that emails are bouncing, going to spam, and the backup mail "
+            "server is unreachable. The email configuration exists but has "
+            "multiple issues.\n\n"
+            "Known facts:\n"
             "- Primary mail server: mail.acme.co at IP 10.0.1.10 "
             "(MX priority 10)\n"
             "- Backup mail server: mail2.acme.co at IP 10.0.1.11 "
             "(MX priority 20)\n"
-            "- SPF record: authorize the 10.0.1.0/24 subnet and the mail "
-            "servers, hard fail all others\n"
-            "- DMARC record: policy=quarantine, send aggregate reports to "
-            "postmaster@acme.co\n\n"
-            "Do NOT modify existing records."
+            "- SPF should authorize the 10.0.1.0/24 subnet with hard fail "
+            "(-all)\n"
+            "- DMARC policy should be quarantine, reports to "
+            "postmaster@acme.co\n"
+            "- The 'mail' hostname must have an A record, not a CNAME "
+            "(CNAME conflicts with MX)\n\n"
+            "Fix all email configuration issues. Do NOT modify web or "
+            "NS records."
         ),
         "zones": {"acme.co": records},
         "required_checks": required_checks,
@@ -181,104 +208,159 @@ def _build_configure_mail() -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_debug_delegation() -> dict:
-    """Two-zone task: fix broken NS delegation between parent and child."""
+    """Three-zone task: fix broken delegation chain across grandparent,
+    parent, and child zones (corp.com -> infra.corp.com -> db.infra.corp.com).
+    """
 
-    parent_records = [
+    # ── Zone 1: corp.com (grandparent) ──────────────────────────────────
+    corp_records = [
         DNSRecord("@", "SOA",
-                  "ns1.parent.org. admin.parent.org. 2024050101 3600 900 604800 86400"),
-        DNSRecord("@", "NS", "ns1.parent.org."),
-        DNSRecord("@", "NS", "ns2.parent.org."),
-        DNSRecord("@", "A", "10.1.0.1"),
-        DNSRecord("www", "CNAME", "parent.org."),
-        DNSRecord("ns1", "A", "10.1.0.2"),
-        DNSRecord("ns2", "A", "10.1.0.3"),
-        # Delegation records for dev.parent.org — all three have bugs:
-        DNSRecord("dev", "NS", "ns1.dev.parent.org."),
-        # BUG: should be ns2, not ns3
-        DNSRecord("dev", "NS", "ns3.dev.parent.org."),
-        # BUG: wrong glue IP — should be 10.1.1.10
-        DNSRecord("ns1.dev", "A", "10.1.1.99"),
-        # BUG: wrong glue hostname — should be ns2.dev
-        DNSRecord("ns3.dev", "A", "10.1.1.11"),
+                  "ns1.corp.com. admin.corp.com. 2024060101 3600 900 604800 86400"),
+        DNSRecord("@", "NS", "ns1.corp.com."),
+        DNSRecord("@", "NS", "ns2.corp.com."),
+        DNSRecord("@", "A", "10.10.0.1"),
+        DNSRecord("www", "CNAME", "corp.com."),
+        DNSRecord("ns1", "A", "10.10.0.2"),
+        DNSRecord("ns2", "A", "10.10.0.3"),
+        # Delegation for infra.corp.com:
+        DNSRecord("infra", "NS", "ns1.infra.corp.com."),
+        DNSRecord("infra", "NS", "ns2.infra.corp.com."),
+        # BUG 1: Stale glue IP — was 10.20.1.10, server migrated but glue
+        #         not updated
+        DNSRecord("ns1.infra", "A", "10.20.1.99"),
+        # BUG 2: Stale glue — wrong IP for ns2 as well
+        DNSRecord("ns2.infra", "A", "10.20.1.98"),
+        # Red herring: old staging delegation (valid, should NOT be touched)
+        DNSRecord("staging", "NS", "ns1.staging.corp.com."),
+        DNSRecord("ns1.staging", "A", "10.40.0.5"),
     ]
 
-    child_records = [
-        # BUG: SOA serial (2024040101) is behind parent's (2024050101)
+    # ── Zone 2: infra.corp.com (parent of db) ──────────────────────────
+    infra_records = [
         DNSRecord("@", "SOA",
-                  "ns1.dev.parent.org. admin.dev.parent.org. 2024040101 3600 900 604800 86400"),
-        DNSRecord("@", "NS", "ns1.dev.parent.org."),
-        # BUG: child NS says ns3 but should be ns2 (must match parent delegation)
-        DNSRecord("@", "NS", "ns3.dev.parent.org."),
-        DNSRecord("ns1", "A", "10.1.1.10"),
-        # BUG: wrong IP for ns2 — should be 10.1.1.11
-        DNSRecord("ns2", "A", "10.1.1.99"),
-        # BUG: wrong IP for web server — should be 10.1.1.20
-        DNSRecord("@", "A", "10.1.1.200"),
-        # BUG: missing trailing dot — should be "dev.parent.org."
-        DNSRecord("www", "CNAME", "dev.parent.org"),
+                  "ns1.infra.corp.com. admin.infra.corp.com. 2024060201 3600 900 604800 86400"),
+        DNSRecord("@", "NS", "ns1.infra.corp.com."),
+        DNSRecord("@", "NS", "ns2.infra.corp.com."),
+        DNSRecord("@", "A", "10.20.1.1"),
+        DNSRecord("ns1", "A", "10.20.1.10"),
+        DNSRecord("ns2", "A", "10.20.1.11"),
+        # Red herring: valid SPF record (looks weird but correct — do NOT
+        # touch)
+        DNSRecord("@", "TXT",
+                  "\"v=spf1 ip4:10.20.1.0/24 include:_spf.corp.com -all\""),
+        # Delegation for db.infra.corp.com:
+        DNSRecord("db", "NS", "ns1.db.infra.corp.com."),
+        # BUG 3: wrong NS name — says ns3 but should be ns2
+        DNSRecord("db", "NS", "ns3.db.infra.corp.com."),
+        # BUG 4: correct glue for ns1 (this one is fine)
+        DNSRecord("ns1.db", "A", "10.30.1.10"),
+        # BUG 5: glue for wrong hostname (ns3 instead of ns2) AND wrong IP
+        DNSRecord("ns3.db", "A", "10.30.1.99"),
+    ]
+
+    # ── Zone 3: db.infra.corp.com (child — the broken one) ─────────────
+    db_records = [
+        # BUG 6: SOA has wrong primary NS (says ns1.infra... should be
+        #         ns1.db.infra...)
+        DNSRecord("@", "SOA",
+                  "ns1.infra.corp.com. admin.db.infra.corp.com. 2024050101 3600 900 604800 86400"),
+        DNSRecord("@", "NS", "ns1.db.infra.corp.com."),
+        DNSRecord("@", "NS", "ns2.db.infra.corp.com."),
+        DNSRecord("ns1", "A", "10.30.1.10"),
+        DNSRecord("ns2", "A", "10.30.1.11"),
+        # BUG 7: wrong IP for web server — should be 10.30.1.20
+        DNSRecord("@", "A", "10.30.1.200"),
+        # BUG 8: missing trailing dot on CNAME
+        DNSRecord("www", "CNAME", "db.infra.corp.com"),
+        # BUG 9: api subdomain points to old decommissioned IP
+        DNSRecord("api", "A", "10.30.1.254"),
     ]
 
     required_checks = [
-        # Parent zone — delegation records
-        {"zone": "parent.org", "qname": "dev",      "qtype": "NS",
-         "expected_rdata": "ns1.dev.parent.org."},
-        {"zone": "parent.org", "qname": "dev",      "qtype": "NS",
-         "expected_rdata": "ns2.dev.parent.org."},
-        {"zone": "parent.org", "qname": "ns1.dev",  "qtype": "A",
-         "expected_rdata": "10.1.1.10"},
-        {"zone": "parent.org", "qname": "ns2.dev",  "qtype": "A",
-         "expected_rdata": "10.1.1.11"},
-        # Child zone — NS and host records
-        {"zone": "dev.parent.org", "qname": "@",    "qtype": "NS",
-         "expected_rdata": "ns1.dev.parent.org."},
-        {"zone": "dev.parent.org", "qname": "@",    "qtype": "NS",
-         "expected_rdata": "ns2.dev.parent.org."},
-        {"zone": "dev.parent.org", "qname": "ns1",  "qtype": "A",
-         "expected_rdata": "10.1.1.10"},
-        {"zone": "dev.parent.org", "qname": "ns2",  "qtype": "A",
-         "expected_rdata": "10.1.1.11"},
-        {"zone": "dev.parent.org", "qname": "@",    "qtype": "A",
-         "expected_rdata": "10.1.1.20"},
-        {"zone": "dev.parent.org", "qname": "www",  "qtype": "CNAME",
-         "expected_rdata": "dev.parent.org."},
-        # Cross-zone consistency: parent NS delegation must match child NS
-        {"check": "delegation_consistency"},
-        # SOA serial in child zone must be valid (>= parent's)
-        {"zone": "dev.parent.org", "check": "soa_serial_valid"},
+        # Corp.com delegation glue must be correct
+        {"zone": "corp.com", "qname": "ns1.infra", "qtype": "A",
+         "expected_rdata": "10.20.1.10"},
+        {"zone": "corp.com", "qname": "ns2.infra", "qtype": "A",
+         "expected_rdata": "10.20.1.11"},
+        # Infra.corp.com delegation must point to correct NS
+        {"zone": "infra.corp.com", "qname": "db", "qtype": "NS",
+         "expected_rdata": "ns1.db.infra.corp.com."},
+        {"zone": "infra.corp.com", "qname": "db", "qtype": "NS",
+         "expected_rdata": "ns2.db.infra.corp.com."},
+        # Infra.corp.com glue must be correct
+        {"zone": "infra.corp.com", "qname": "ns1.db", "qtype": "A",
+         "expected_rdata": "10.30.1.10"},
+        {"zone": "infra.corp.com", "qname": "ns2.db", "qtype": "A",
+         "expected_rdata": "10.30.1.11"},
+        # DB zone NS must match delegation
+        {"zone": "db.infra.corp.com", "qname": "@", "qtype": "NS",
+         "expected_rdata": "ns1.db.infra.corp.com."},
+        {"zone": "db.infra.corp.com", "qname": "@", "qtype": "NS",
+         "expected_rdata": "ns2.db.infra.corp.com."},
+        {"zone": "db.infra.corp.com", "qname": "ns1", "qtype": "A",
+         "expected_rdata": "10.30.1.10"},
+        {"zone": "db.infra.corp.com", "qname": "ns2", "qtype": "A",
+         "expected_rdata": "10.30.1.11"},
+        # DB web server must resolve
+        {"zone": "db.infra.corp.com", "qname": "@", "qtype": "A",
+         "expected_rdata": "10.30.1.20"},
+        {"zone": "db.infra.corp.com", "qname": "www", "qtype": "CNAME",
+         "expected_rdata": "db.infra.corp.com."},
+        # API must point to new server
+        {"zone": "db.infra.corp.com", "qname": "api", "qtype": "A",
+         "expected_rdata": "10.30.1.30"},
     ]
 
-    parent_original_correct = [
-        ("@",   "A",     "10.1.0.1"),
-        ("@",   "NS",    "ns1.parent.org."),
-        ("@",   "NS",    "ns2.parent.org."),
-        ("www", "CNAME", "parent.org."),
-        ("ns1", "A",     "10.1.0.2"),
-        ("ns2", "A",     "10.1.0.3"),
-    ]
+    original_correct = {
+        "corp.com": [
+            ("@", "A", "10.10.0.1"),
+            ("@", "NS", "ns1.corp.com."),
+            ("@", "NS", "ns2.corp.com."),
+            ("www", "CNAME", "corp.com."),
+            ("ns1", "A", "10.10.0.2"),
+            ("ns2", "A", "10.10.0.3"),
+            ("staging", "NS", "ns1.staging.corp.com."),
+            ("ns1.staging", "A", "10.40.0.5"),
+        ],
+        "infra.corp.com": [
+            ("@", "A", "10.20.1.1"),
+            ("@", "NS", "ns1.infra.corp.com."),
+            ("@", "NS", "ns2.infra.corp.com."),
+            ("ns1", "A", "10.20.1.10"),
+            ("ns2", "A", "10.20.1.11"),
+        ],
+    }
 
     return {
         "task_id": "debug_delegation",
         "description": (
-            "The subdomain dev.parent.org is completely unreachable. The "
-            "parent zone parent.org delegates to dev.parent.org, but the "
-            "delegation is broken. You have access to BOTH zone files. "
-            "Debug and fix the delegation so that dev.parent.org resolves "
-            "correctly.\n\n"
+            "A critical production database at db.infra.corp.com is "
+            "unreachable. The DNS delegation chain from corp.com through "
+            "infra.corp.com to db.infra.corp.com is broken at multiple "
+            "points. You have access to ALL THREE zone files.\n\n"
             "Known facts:\n"
-            "- dev.parent.org nameservers should be ns1.dev.parent.org "
-            "(10.1.1.10) and ns2.dev.parent.org (10.1.1.11)\n"
-            "- dev.parent.org should have a web server at 10.1.1.20 "
+            "- infra.corp.com nameservers: ns1.infra.corp.com (10.20.1.10) "
+            "and ns2.infra.corp.com (10.20.1.11)\n"
+            "- db.infra.corp.com nameservers: ns1.db.infra.corp.com "
+            "(10.30.1.10) and ns2.db.infra.corp.com (10.30.1.11)\n"
+            "- db.infra.corp.com web server: 10.30.1.20 "
             "(A record for @ and www)\n"
-            "- The parent zone's NS delegation and glue records must match "
-            "the child zone's NS records"
+            "- The corp.com zone was recently migrated and some records "
+            "are stale\n"
+            "- The api.db.infra.corp.com server was migrated to "
+            "10.30.1.30\n"
+            "- There are some unrelated records in the zones (staging, "
+            "SPF) — do NOT modify those\n"
+            "- Do NOT modify any records in the corp.com zone that are "
+            "unrelated to the infra delegation\n\n"
+            "Fix all delegation issues across the three zones."
         ),
         "zones": {
-            "parent.org": parent_records,
-            "dev.parent.org": child_records,
+            "corp.com": corp_records,
+            "infra.corp.com": infra_records,
+            "db.infra.corp.com": db_records,
         },
         "required_checks": required_checks,
-        "original_correct": {
-            "parent.org": parent_original_correct,
-        },
-        "max_steps": 30,
+        "original_correct": original_correct,
+        "max_steps": 35,
     }
