@@ -159,7 +159,12 @@ class DNSEnvironment:
             task_id = TASK_IDS[self._task_cycle_index % len(TASK_IDS)]
             self._task_cycle_index += 1
 
-        self.task_config = get_task(task_id)
+        try:
+            self.task_config = get_task(task_id)
+        except ValueError:
+            # Invalid task_id — fall back to first task
+            task_id = TASK_IDS[0]
+            self.task_config = get_task(task_id)
 
         # Deep-copy zones so original task data stays pristine ---------
         self.zones = {

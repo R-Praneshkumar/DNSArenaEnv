@@ -579,9 +579,13 @@ def _check_resolution(
 
 
 def _rdata_match(actual: str, expected: str) -> bool:
-    """Case-insensitive rdata comparison, ignoring trailing dots and whitespace."""
-    a = actual.strip().rstrip(".").lower()
-    e = expected.strip().rstrip(".").lower()
+    """Case-insensitive rdata comparison preserving trailing dots.
+
+    Trailing dots are semantically significant in DNS (FQDN vs relative),
+    so they must NOT be stripped during comparison.
+    """
+    a = actual.strip().lower()
+    e = expected.strip().lower()
     return a == e
 
 

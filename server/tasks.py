@@ -95,8 +95,12 @@ def _build_fix_single_record() -> dict:
         "description": (
             "The DNS zone file for example.com has errors causing resolution "
             "failures. The website at www.example.com is unreachable, and "
-            "emails are not being delivered. Examine the zone file and fix "
-            "the broken records."
+            "emails are not being delivered.\n\n"
+            "Known facts:\n"
+            "- www.example.com should be a CNAME pointing to example.com\n"
+            "- The mail server is at 93.184.216.35\n"
+            "- Mail should be delivered via mail.example.com (MX priority 10)\n\n"
+            "Examine the zone file and fix the broken records."
         ),
         "zones": {"example.com": records},
         "required_checks": required_checks,
@@ -203,10 +207,13 @@ def _build_debug_delegation() -> dict:
         DNSRecord("@", "SOA",
                   "ns1.dev.parent.org. admin.dev.parent.org. 2024040101 3600 900 604800 86400"),
         DNSRecord("@", "NS", "ns1.dev.parent.org."),
-        DNSRecord("@", "NS", "ns2.dev.parent.org."),
+        # BUG: child NS says ns3 but should be ns2 (must match parent delegation)
+        DNSRecord("@", "NS", "ns3.dev.parent.org."),
         DNSRecord("ns1", "A", "10.1.1.10"),
-        DNSRecord("ns2", "A", "10.1.1.11"),
-        DNSRecord("@", "A", "10.1.1.20"),
+        # BUG: wrong IP for ns2 — should be 10.1.1.11
+        DNSRecord("ns2", "A", "10.1.1.99"),
+        # BUG: wrong IP for web server — should be 10.1.1.20
+        DNSRecord("@", "A", "10.1.1.200"),
         # BUG: missing trailing dot — should be "dev.parent.org."
         DNSRecord("www", "CNAME", "dev.parent.org"),
     ]
